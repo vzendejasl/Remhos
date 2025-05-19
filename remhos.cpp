@@ -39,7 +39,7 @@
 #include "remhos_tools.hpp"
 #include "remhos_sync.hpp"
 #include "fem/qinterp/eval.hpp"
-#include "fem/qinterp/det.cpp"
+#include "fem/qinterp/det.hpp"
 #include "fem/qinterp/grad.hpp"
 #include "fem/integ/bilininteg_mass_kernels.hpp"
 
