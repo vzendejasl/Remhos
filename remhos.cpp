@@ -47,6 +47,7 @@
 #define REMHOS_USE_DEVICE_UMPIRE
 #include <umpire/Umpire.hpp>
 #include <umpire/strategy/QuickPool.hpp>
+#endif
 
 #ifdef USE_CALIPER
 #include <caliper/cali.h>
