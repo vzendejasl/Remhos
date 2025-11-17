@@ -209,6 +209,7 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    int vis_steps = 100;
    const char *device_config = "cpu";
    bool gpu_aware_mpi = false;
+   int dev_pool_size = 4;
 
    int precision = 8;
    cout.precision(precision);
@@ -296,6 +297,8 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
                   "Enable remap of synchronized product fields.");
    args.AddOption(&vis_steps, "-vs", "--visualization-steps",
                   "Visualize every n-th timestep.");
+   args.AddOption(&dev_pool_size, "-pool", "--dev-pool-size",
+                  "Size (in GB) for the umpire device pool");
    args.Parse();
    if (!args.Good())
    {
@@ -307,7 +310,9 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
 #ifdef REMHOS_USE_DEVICE_UMPIRE
    auto &rm = umpire::ResourceManager::getInstance();
    const char * allocator_name = "remhos_device_alloc";
-   rm.makeAllocator<umpire::strategy::QuickPool>(allocator_name, rm.getAllocator("DEVICE"));
+   size_t umpire_dev_pool_size = ((size_t) dev_pool_size) * 1024 * 1024 * 1024;
+   size_t umpire_dev_block_size = 1024 * 1024;
+   rm.makeAllocator<umpire::strategy::QuickPool>(allocator_name, rm.getAllocator("DEVICE"), umpire_dev_pool_size, umpire_dev_block_size);
 
 #ifdef HYPRE_USING_UMPIRE
    HYPRE_SetUmpireDevicePoolName(allocator_name);
