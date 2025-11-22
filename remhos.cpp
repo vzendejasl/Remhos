@@ -347,8 +347,8 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    // Enable hardware devices such as GPUs, and programming models such as
    // CUDA, OCCA, RAJA and OpenMP based on command line options.
    Device device(device_config);
-   if (myid == 0) { device.Print(); }
    device.SetGPUAwareMPI(gpu_aware_mpi);
+   if (myid == 0) { device.Print(); }
 
    if (myid == 0) { KernelReporter::Enable(); }
    using TENS = QuadratureInterpolator::TensorEvalKernels;
