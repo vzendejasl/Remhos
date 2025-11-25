@@ -43,6 +43,12 @@
 #include "fem/qinterp/grad.hpp"
 #include "fem/integ/bilininteg_mass_kernels.hpp"
 
+#if (defined(HYPRE_USING_UMPIRE) || defined(MFEM_USE_UMPIRE)) && (defined(MFEM_USE_CUDA) || defined(MFEM_USE_HIP))
+#define REMHOS_USE_DEVICE_UMPIRE
+#include <umpire/Umpire.hpp>
+#include <umpire/strategy/QuickPool.hpp>
+#endif
+
 #ifdef USE_CALIPER
 #include <caliper/cali.h>
 #include <caliper/cali-manager.h>
@@ -202,6 +208,8 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    bool product_sync = false;
    int vis_steps = 100;
    const char *device_config = "cpu";
+   bool gpu_aware_mpi = false;
+   int dev_pool_size = 4;
 
    int precision = 8;
    cout.precision(precision);
@@ -257,6 +265,8 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
                   "Enable or disable next gen full assembly for the HO solution.");
    args.AddOption(&device_config, "-d", "--device",
                   "Device configuration string, see Device::Configure().");
+   args.AddOption(&gpu_aware_mpi, "-gam", "--gpu-aware-mpi", "-no-gam",
+                  "--no-gpu-aware-mpi", "Enable GPU aware MPI communications.");
    args.AddOption(&smth_ind_type, "-si", "--smth_ind",
                   "Smoothness indicator: 0 - no smoothness indicator,\n\t"
                   "                      1 - approx_quadratic,\n\t"
@@ -287,6 +297,8 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
                   "Enable remap of synchronized product fields.");
    args.AddOption(&vis_steps, "-vs", "--visualization-steps",
                   "Visualize every n-th timestep.");
+   args.AddOption(&dev_pool_size, "-pool", "--dev-pool-size",
+                  "Size (in GB) for the umpire device pool");
    args.Parse();
    if (!args.Good())
    {
@@ -294,6 +306,24 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
       return 1;
    }
    if (myid == 0) { args.PrintOptions(cout); }
+
+#ifdef REMHOS_USE_DEVICE_UMPIRE
+   auto &rm = umpire::ResourceManager::getInstance();
+   const char * allocator_name = "remhos_device_alloc";
+   size_t umpire_dev_pool_size = ((size_t) dev_pool_size) * 1024 * 1024 * 1024;
+   size_t umpire_dev_block_size = 1024 * 1024;
+   rm.makeAllocator<umpire::strategy::QuickPool>(allocator_name, rm.getAllocator("DEVICE"), umpire_dev_pool_size, umpire_dev_block_size);
+
+#ifdef HYPRE_USING_UMPIRE
+   HYPRE_SetUmpireDevicePoolName(allocator_name);
+#endif // HYPRE_USING_UMPIRE
+
+#ifdef MFEM_USE_UMPIRE
+   MemoryManager::SetUmpireDeviceAllocatorName(allocator_name);
+   // the umpire host memory type is slow compared to the native host memory type
+   Device::SetMemoryTypes(MemoryType::HOST, MemoryType::DEVICE_UMPIRE);
+#endif // MFEM_USING_UMPIRE
+#endif // REMHOS_USE_DEVICE_UMPIRE
 
 //setup caliper config manager
 #ifdef USE_CALIPER
@@ -317,6 +347,7 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    // Enable hardware devices such as GPUs, and programming models such as
    // CUDA, OCCA, RAJA and OpenMP based on command line options.
    Device device(device_config);
+   device.SetGPUAwareMPI(gpu_aware_mpi);
    if (myid == 0) { device.Print(); }
 
    if (myid == 0) { KernelReporter::Enable(); }
