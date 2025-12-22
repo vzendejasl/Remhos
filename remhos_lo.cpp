@@ -330,7 +330,7 @@ const DofToQuad *get_maps(ParFiniteElementSpace &pfes, Assembly &asmbly)
    return &el_trace->GetDofToQuad(*asmbly.lom.irF, DofToQuad::TENSOR);
 }
 
-//====
+//
 //Residual Distribution
 //
 PAResidualDistribution::PAResidualDistribution(ParFiniteElementSpace &space,
@@ -1034,7 +1034,7 @@ void PAResidualDistribution::CalcLOSolution(const Vector &u, Vector &du) const
    });
 }
 
-//====
+//
 //PA Residual Distribution Subcell
 //
 PAResidualDistributionSubcell::PAResidualDistributionSubcell
