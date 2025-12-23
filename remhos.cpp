@@ -1854,6 +1854,11 @@ void AdvectionOperator::PrintTimingData(int steps) const
    const MPI_Comm com = M_HO.ParFESpace()->GetComm();
    const int myid = M_HO.ParFESpace()->GetMyRank();
 
+   auto ho  = dynamic_cast<LocalInverseHOSolver *>(ho_solver);
+   auto lo  = dynamic_cast<MassBasedAvg *>(lo_solver);
+   auto fct = dynamic_cast<ClipScaleSolver *>(fct_solver);
+   if (!ho || !lo || !fct) { return; }
+
    double my_rt[5], T[5];
    my_rt[0] = timer.sw_rhs.RealTime();
    my_rt[1] = timer.sw_L2inv.RealTime();
