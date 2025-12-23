@@ -414,8 +414,8 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    }
    else
    {
-      mesh = CartesianMesh(dim, Mpi::WorldSize(), elem_per_mpi, myid == 0,
-                           rp_levels, &mpi_partitioning);
+      mesh = PartitionMPI(dim, Mpi::WorldSize(), elem_per_mpi, myid == 0,
+                          rp_levels, &mpi_partitioning);
    }
    dim = mesh->Dimension();
    mesh->GetBoundingBox(bb_min, bb_max, max(order, 1));
