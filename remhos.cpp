@@ -62,8 +62,6 @@
 using namespace std;
 using namespace mfem;
 
-//#define REMHOS_GPU_SETUP
-
 enum class HOSolverType
 { None, Neumann, CG, LocalInverse };
 
@@ -121,8 +119,6 @@ private:
    TimeStepControl dt_control;
    mutable double dt_est, dt_ratio;
 
-   mutable TimingData timer;
-
    Assembly &asmbl;
 
    LowOrderMethod &lom;
@@ -132,6 +128,9 @@ private:
    LOSolver *lo_solver;
    FCTSolver *fct_solver;
    MonolithicSolver *mono_solver;
+
+   mutable TimingData timer;
+   const bool gpu_setup;
 
    void UpdateTimeStepEstimate(const Vector &x, const Vector &dx,
                                const Vector &x_min, const Vector &x_max) const;
@@ -145,7 +144,7 @@ public:
                      GridFunction &vel, GridFunction &sub_vel,
                      Assembly &_asmbl, LowOrderMethod &_lom, DofInfo &_dofs,
                      HOSolver *hos, LOSolver *los, FCTSolver *fct,
-                     MonolithicSolver *mos);
+                     MonolithicSolver *mos, bool gpu);
 
    void MultUnlimited(const Vector &x, Vector &y) const override;
 
@@ -359,18 +358,20 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    //adiak::cmdline();
    //adiak::hostname();
 #endif
-    
-#ifdef REMHOS_GPU_SETUP
-   MFEM_VERIFY(ho_type  == HOSolverType::LocalInverse &&
-               lo_type  == LOSolverType::MassBased &&
-               fct_type == FCTSolverType::ClipScale, "Wrong GPU setup.");
-#endif
 
    // Enable hardware devices such as GPUs, and programming models such as
    // CUDA, OCCA, RAJA and OpenMP based on command line options.
    Device device(device_config);
    device.SetGPUAwareMPI(gpu_aware_mpi);
    if (myid == 0) { device.Print(); }
+
+   const bool gpu_setup = device.Allows(Backend::DEVICE_MASK);
+   if (gpu_setup)
+   {
+      MFEM_VERIFY(ho_type  == HOSolverType::LocalInverse &&
+                  lo_type  == LOSolverType::MassBased &&
+                  fct_type == FCTSolverType::ClipScale, "Wrong GPU setup.");
+   }
 
    if (myid == 0) { KernelReporter::Enable(); }
    using TENS = QuadratureInterpolator::TensorEvalKernels;
@@ -1070,7 +1071,8 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
 
    AdvectionOperator adv(offset, m, ml, lumpedM, k, M_HO, K_HO,
                          x, xsub, v_gf, v_sub_gf, asmbl, lom, dofs,
-                         ho_solver, lo_solver, fct_solver, mono_solver);
+                         ho_solver, lo_solver, fct_solver, mono_solver,
+                         gpu_setup);
 
    adv.verify_bounds = verify_bounds;
    if (fct_solver) { fct_solver->verify_bounds = verify_bounds; }
@@ -1463,8 +1465,9 @@ AdvectionOperator::AdvectionOperator(const Array<int> &offsets,
                                      GridFunction &vel, GridFunction &sub_vel,
                                      Assembly &_asmbl,
                                      LowOrderMethod &_lom, DofInfo &_dofs,
-                                     HOSolver *hos, LOSolver *los, FCTSolver *fct,
-                                     MonolithicSolver *mos) :
+                                     HOSolver *hos, LOSolver *los,
+                                     FCTSolver *fct, MonolithicSolver *mos,
+                                     bool gpu) :
    LimitedTimeDependentOperator(offsets.Last()), block_offsets(offsets),
    Mbf(Mbf_), ml(_ml), Kbf(Kbf_),
    M_HO(M_HO_), K_HO(K_HO_),
@@ -1474,9 +1477,9 @@ AdvectionOperator::AdvectionOperator(const Array<int> &offsets,
    mesh_pos(pos), submesh_pos(sub_pos),
    mesh_vel(vel), submesh_vel(sub_vel),
    x_gf(Kbf.ParFESpace()),
-   timer(M_HO.Size()),
    asmbl(_asmbl), lom(_lom), dofs(_dofs),
-   ho_solver(hos), lo_solver(los), fct_solver(fct), mono_solver(mos)
+   ho_solver(hos), lo_solver(los), fct_solver(fct), mono_solver(mos),
+   timer(M_HO.Size()), gpu_setup(gpu)
 {
    if (ho_solver)  { ho_solver->timer  = &timer; }
    if (lo_solver)  { lo_solver->timer  = &timer; }
@@ -1538,14 +1541,15 @@ void AdvectionOperator::MultUnlimited(const Vector &X, Vector &Y) const
       // Reset precomputed geometric data.
       Mbf.FESpace()->GetMesh()->DeleteGeometricFactors();
 
-#ifndef REMHOS_GPU_SETUP
-      // Reassemble on the new mesh. Element contributions.
-      // Currently needed to have the sparse matrices used by the LO methods.
-      Mbf.BilinearForm::operator=(0.0);
-      Mbf.Assemble();
-      Kbf.BilinearForm::operator=(0.0);
-      Kbf.Assemble(0);
-#endif
+      if (gpu_setup == false)
+      {
+         // Reassemble on the new mesh. Element contributions.
+         // Currently needed to have the sparse matrices used by the LO methods.
+         Mbf.BilinearForm::operator=(0.0);
+         Mbf.Assemble();
+         Kbf.BilinearForm::operator=(0.0);
+         Kbf.Assemble(0);
+      }
 
       timer.sw_L2inv.Start();
       M_HO.BilinearForm::operator=(0.0);
@@ -1572,37 +1576,38 @@ void AdvectionOperator::MultUnlimited(const Vector &X, Vector &Y) const
          lom.pk->Assemble();
       }
 
-#ifndef REMHOS_GPU_SETUP
-      // Face contributions.
-      asmbl.bdrInt = 0.;
-      Mesh *mesh = M_HO.FESpace()->GetMesh();
-      const int dim = mesh->Dimension(), ne = mesh->GetNE();
-      Array<int> bdrs, orientation;
-      FaceElementTransformations *Trans;
+      if (gpu_setup == false)
+      {
+         // Face contributions.
+         asmbl.bdrInt = 0.;
+         Mesh *mesh = M_HO.FESpace()->GetMesh();
+         const int dim = mesh->Dimension(), ne = mesh->GetNE();
+         Array<int> bdrs, orientation;
+         FaceElementTransformations *Trans;
 
-      if (auto RD_ptr = dynamic_cast<const PAResidualDistribution*>(lo_solver))
-      {
-         RD_ptr->SampleVelocity(FaceType::Interior);
-         RD_ptr->SampleVelocity(FaceType::Boundary);
-         RD_ptr->SetupPA(FaceType::Interior);
-         RD_ptr->SetupPA(FaceType::Boundary);
-      }
-      else
-      {
-         for (int k = 0; k < ne; k++)
+         if (auto RD_ptr = dynamic_cast<const PAResidualDistribution*>(lo_solver))
          {
-            if (dim == 1)      { mesh->GetElementVertices(k, bdrs); }
-            else if (dim == 2) { mesh->GetElementEdges(k, bdrs, orientation); }
-            else if (dim == 3) { mesh->GetElementFaces(k, bdrs, orientation); }
-
-            for (int i = 0; i < dofs.numBdrs; i++)
+            RD_ptr->SampleVelocity(FaceType::Interior);
+            RD_ptr->SampleVelocity(FaceType::Boundary);
+            RD_ptr->SetupPA(FaceType::Interior);
+            RD_ptr->SetupPA(FaceType::Boundary);
+         }
+         else
+         {
+            for (int k = 0; k < ne; k++)
             {
-               Trans = mesh->GetFaceElementTransformations(bdrs[i]);
-               asmbl.ComputeFluxTerms(k, i, Trans, lom);
+               if (dim == 1)      { mesh->GetElementVertices(k, bdrs); }
+               else if (dim == 2) { mesh->GetElementEdges(k, bdrs, orientation); }
+               else if (dim == 3) { mesh->GetElementFaces(k, bdrs, orientation); }
+
+               for (int i = 0; i < dofs.numBdrs; i++)
+               {
+                  Trans = mesh->GetFaceElementTransformations(bdrs[i]);
+                  asmbl.ComputeFluxTerms(k, i, Trans, lom);
+               }
             }
          }
       }
-#endif
    }
 
    // Needed because X and Y are allocated on the host by the ODESolver.
