@@ -126,7 +126,6 @@ void LocalInverseHOSolver::CalcHOSolution(const Vector &u, Vector &du) const
       M_inv->Update(), M_inv->Mult(rhs, du);
       timer->sw_L2inv.Stop();
    }
-
 }
 
 NeumannHOSolver::NeumannHOSolver(ParFiniteElementSpace &space,

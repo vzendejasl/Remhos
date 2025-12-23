@@ -373,10 +373,22 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
                   fct_type == FCTSolverType::ClipScale, "Wrong GPU setup.");
    }
 
+   // Prepare the missing kernels.
    if (myid == 0) { KernelReporter::Enable(); }
    using TENS = QuadratureInterpolator::TensorEvalKernels;
    using DET  = QuadratureInterpolator::DetKernels;
    using GRAD = QuadratureInterpolator::GradKernels;
+   // 2D Q1.
+   TENS::Specialization<2,QVectorLayout::byNODES,1,2,3>::Opt<1>::Add();
+   TENS::Specialization<2,QVectorLayout::byVDIM,2,3,3>::Opt<1>::Add();
+   DET::Specialization<2,2,3,3>::Add();
+   // 2D Q2 should hit not fallbacks.
+   // 2D Q3.
+   TENS::Specialization<2,QVectorLayout::byNODES,1,4,5>::Opt<1>::Add();
+   TENS::Specialization<2,QVectorLayout::byVDIM,2,3,5>::Opt<1>::Add();
+   DET::Specialization<2,2,3,5>::Add();
+   GRAD::Specialization<2,QVectorLayout::byNODES,0,2,3,5>::Add();
+   // 3D Q1 should hit no fallbacks.
    // 3D Q2.
    TENS::Specialization<3,QVectorLayout::byNODES,1,3,5>::Opt<1>::Add();
    TENS::Specialization<3,QVectorLayout::byVDIM,3,3,5>::Opt<1>::Add();
