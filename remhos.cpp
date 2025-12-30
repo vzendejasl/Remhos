@@ -424,7 +424,7 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    // Refine the mesh further in parallel to increase the resolution.
    ParMesh pmesh(MPI_COMM_WORLD, *mesh, mpi_partitioning);
    delete mesh;
-   delete mpi_partitioning;
+   delete[] mpi_partitioning;
    for (int lev = 0; lev < rp_levels; lev++) { pmesh.UniformRefinement(); }
    MPI_Comm comm = pmesh.GetComm();
    const int NE  = pmesh.GetNE();
@@ -1313,10 +1313,11 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
            << " (" << ti_total-ti << " repeated)." << endl;
    }
 
-   // Move to the final mesh position
+   // Move to the final mesh position.
+   // (use t instead of t_final in case we're taking at most max_tsteps steps).
    if (exec_mode == 1)
    {
-      add(x0, t_final, v_gf, x);
+      add(x0, t, v_gf, x);
       // Reset precomputed geometric data.
       pmesh.DeleteGeometricFactors();
    }
