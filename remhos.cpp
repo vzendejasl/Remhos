@@ -43,6 +43,10 @@
 #include "fem/qinterp/det.hpp"
 #include "fem/qinterp/grad.hpp"
 #include "fem/integ/bilininteg_mass_kernels.hpp"
+#include "fem/integ/bilininteg_convection_kernels.hpp"
+#include "fem/integ/bilininteg_dgtrace_kernels.hpp"
+#include "fem/dgmassinv.hpp"
+
 
 #if (defined(HYPRE_USING_UMPIRE) || defined(MFEM_USE_UMPIRE)) && (defined(MFEM_USE_CUDA) || defined(MFEM_USE_HIP))
 #define REMHOS_USE_DEVICE_UMPIRE
@@ -382,49 +386,61 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    TENS::Specialization<2,QVectorLayout::byNODES,1,2,3>::Opt<1>::Add();
    TENS::Specialization<2,QVectorLayout::byVDIM,2,3,3>::Opt<1>::Add();
    DET::Specialization<2,2,3,3>::Add();
-   // 2D Q2 should hit not fallbacks.
+   DGTraceIntegrator::AddSpecialization<2,2,3>();
+   DGMassInverse::CGKernels::Specialization<2,2,3>::Add();
+   // 2D Q2.
+   DGTraceIntegrator::AddSpecialization<2,3,4>();
+   DGMassInverse::CGKernels::Specialization<2,3,4>::Add();
    // 2D Q3.
    TENS::Specialization<2,QVectorLayout::byNODES,1,4,5>::Opt<1>::Add();
    TENS::Specialization<2,QVectorLayout::byVDIM,2,3,5>::Opt<1>::Add();
    DET::Specialization<2,2,3,5>::Add();
    GRAD::Specialization<2,QVectorLayout::byNODES,0,2,3,5>::Add();
-   // 3D Q1 should hit no fallbacks.
+   DGTraceIntegrator::AddSpecialization<2,4,5>();
+   DGMassInverse::CGKernels::Specialization<2,4,5>::Add();
+   // 3D Q1.
+   DGTraceIntegrator::AddSpecialization<3,2,4>();
+   ConvectionIntegrator::AddSpecialization<3,2,4>();
+   DGMassInverse::CGKernels::Specialization<3,2,4>::Add();
    // 3D Q2.
    TENS::Specialization<3,QVectorLayout::byNODES,1,3,5>::Opt<1>::Add();
    TENS::Specialization<3,QVectorLayout::byVDIM,3,3,5>::Opt<1>::Add();
    GRAD::Specialization<3,QVectorLayout::byNODES,0,3,2,2>::Add();
    GRAD::Specialization<3,QVectorLayout::byVDIM,0,3,2,2>::Add();
    MassIntegrator::AddSpecialization<3,3,5>();
+   DGTraceIntegrator::AddSpecialization<3,3,5>();
+   ConvectionIntegrator::AddSpecialization<3,3,5>();
    // 3D Q3.
    TENS::Specialization<3,QVectorLayout::byNODES,1,4,6>::Opt<1>::Add();
+   DGTraceIntegrator::AddSpecialization<3,4,6>();
+   ConvectionIntegrator::AddSpecialization<3,4,6>();
 
    // When not using lua, exec mode is derived from problem number convention
    if (problem_num < 10)      { exec_mode = 0; }
    else if (problem_num < 20) { exec_mode = 1; }
    else { MFEM_ABORT("Unspecified execution mode."); }
 
-   Mesh *mesh = nullptr;
-   int *mpi_partitioning = nullptr;
+   Mesh mesh;
+   Array<int> mpi_partitioning;
    if (strncmp(mesh_file, "default", 7) != 0)
    {
       // Read the serial mesh from the given mesh file on all processors.
       // Refine the mesh in serial to increase the resolution.
-      mesh = new Mesh(Mesh::LoadFromFile(mesh_file, 1, 1));
-      for (int lev = 0; lev < rs_levels; lev++) { mesh->UniformRefinement(); }
+      mesh = Mesh::LoadFromFile(mesh_file, 1, 1);
+      for (int lev = 0; lev < rs_levels; lev++) { mesh.UniformRefinement(); }
    }
    else
    {
       mesh = PartitionMPI(dim, Mpi::WorldSize(), elem_per_mpi, myid == 0,
-                          rp_levels, &mpi_partitioning);
+                          rp_levels, mpi_partitioning);
    }
-   dim = mesh->Dimension();
-   mesh->GetBoundingBox(bb_min, bb_max, max(order, 1));
+   dim = mesh.Dimension();
+   mesh.GetBoundingBox(bb_min, bb_max, max(order, 1));
 
    // Parallel partitioning of the mesh.
    // Refine the mesh further in parallel to increase the resolution.
-   ParMesh pmesh(MPI_COMM_WORLD, *mesh, mpi_partitioning);
-   delete mesh;
-   delete[] mpi_partitioning;
+   ParMesh pmesh(MPI_COMM_WORLD, mesh, mpi_partitioning.GetData());
+   mesh.Clear();
    for (int lev = 0; lev < rp_levels; lev++) { pmesh.UniformRefinement(); }
    MPI_Comm comm = pmesh.GetComm();
    const int NE  = pmesh.GetNE();
