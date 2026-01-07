@@ -45,7 +45,7 @@
 #include "fem/integ/bilininteg_mass_kernels.hpp"
 #include "fem/integ/bilininteg_convection_kernels.hpp"
 #include "fem/integ/bilininteg_dgtrace_kernels.hpp"
-#include "fem/dgmassinv.hpp"
+#include "fem/dgmassinv_kernels.hpp"
 
 
 #if (defined(HYPRE_USING_UMPIRE) || defined(MFEM_USE_UMPIRE)) && (defined(MFEM_USE_CUDA) || defined(MFEM_USE_HIP))
