@@ -25,6 +25,7 @@ namespace mfem
 {
 
 class SmoothnessIndicator;
+struct TimingData;
 
 // Monotone, High-order, Conservative Solver.
 class FCTSolver
@@ -84,6 +85,7 @@ public:
       MFEM_ABORT("Product remap is not implemented for the chosen solver");
    }
 
+   TimingData *timer = nullptr;
    bool verify_bounds = false;
 };
 

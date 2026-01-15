@@ -39,6 +39,29 @@
 #include "remhos_tools.hpp"
 #include "remhos_sync.hpp"
 #include "remhos_solvers.hpp"
+#include "fem/qinterp/eval.hpp"
+#include "fem/qinterp/det.hpp"
+#include "fem/qinterp/grad.hpp"
+#include "fem/integ/bilininteg_mass_kernels.hpp"
+#include "fem/integ/bilininteg_convection_kernels.hpp"
+#include "fem/integ/bilininteg_dgtrace_kernels.hpp"
+#include "fem/dgmassinv_kernels.hpp"
+
+
+#if (defined(HYPRE_USING_UMPIRE) || defined(MFEM_USE_UMPIRE)) && (defined(MFEM_USE_CUDA) || defined(MFEM_USE_HIP))
+#define REMHOS_USE_DEVICE_UMPIRE
+#include <umpire/Umpire.hpp>
+#include <umpire/strategy/QuickPool.hpp>
+#endif
+
+#ifdef USE_CALIPER
+#include <caliper/cali.h>
+#include <caliper/cali-manager.h>
+//#include <adiak.hpp>
+#ifdef HAVE_MPI
+#include <caliper/cali-mpi.h>
+#endif
+#endif
 
 using namespace std;
 using namespace mfem;
@@ -79,6 +102,9 @@ double inflow_function(const Vector &x);
 // Mesh bounding box
 Vector bb_min, bb_max;
 
+//Caliper setup
+void setupCaliper();
+
 class AdvectionOperator : public LimitedTimeDependentOperator
 {
 private:
@@ -87,7 +113,7 @@ private:
    BilinearForm &Mbf, &ml;
    ParBilinearForm &Kbf;
    ParBilinearForm &M_HO, &K_HO;
-   Vector &lumpedM;
+   Vector &lumpedM, ones;
 
    Vector start_mesh_pos, start_submesh_pos;
    GridFunction &mesh_pos, *submesh_pos, &mesh_vel, &submesh_vel;
@@ -95,7 +121,8 @@ private:
    mutable ParGridFunction x_gf;
 
    TimeStepControl dt_control;
-   mutable real_t dt_est, dt_ratio;
+   mutable double dt_est, dt_ratio;
+
    Assembly &asmbl;
 
    LowOrderMethod &lom;
@@ -105,6 +132,9 @@ private:
    LOSolver *lo_solver;
    FCTSolver *fct_solver;
    MonolithicSolver *mono_solver;
+
+   mutable TimingData timer;
+   const bool gpu_setup;
 
    void UpdateTimeStepEstimate(const Vector &x, const Vector &dx,
                                const Vector &x_min, const Vector &x_max) const;
@@ -118,7 +148,7 @@ public:
                      GridFunction &vel, GridFunction &sub_vel,
                      Assembly &_asmbl, LowOrderMethod &_lom, DofInfo &_dofs,
                      HOSolver *hos, LOSolver *los, FCTSolver *fct,
-                     MonolithicSolver *mos);
+                     MonolithicSolver *mos, bool gpu);
 
    void MultUnlimited(const Vector &x, Vector &y) const override;
 
@@ -154,18 +184,31 @@ public:
       start_submesh_pos = sm_pos;
    }
 
+   void PrintTimingData(int steps) const;
    bool verify_bounds = false;
 
    virtual ~AdvectionOperator() { }
 };
 
+#ifndef MFEM_USE_CMAKE_TESTS
+int remhos(int, char *[], double &);
+
 int main(int argc, char *argv[])
+{
+   double final_mass_u = M_PI; // unused
+   return remhos(argc, argv, final_mass_u);
+}
+#endif // MFEM_USE_CMAKE_TESTS
+
+MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
 {
    // Initialize MPI.
    mfem::MPI_Session mpi(argc, argv);
    const int myid = mpi.WorldRank();
 
-   const char *mesh_file = "data/periodic-square.mesh";
+   const char *mesh_file = "default";
+   int dim = 3;
+   int elem_per_mpi = 1;
    int rs_levels = 2;
    int rp_levels = 0;
    int order = 3;
@@ -182,12 +225,16 @@ int main(int argc, char *argv[])
    double t_final = 4.0;
    TimeStepControl dt_control = TimeStepControl::FixedTimeStep;
    double dt = 0.005;
+   int max_tsteps = -1;
    bool visualization = true;
+   bool save_meshes_and_solution = false;
    bool visit = false;
    bool verify_bounds = false;
    bool product_sync = false;
    int vis_steps = 100;
    const char *device_config = "cpu";
+   bool gpu_aware_mpi = false;
+   int dev_pool_size = 4;
 
    int precision = 8;
    cout.precision(precision);
@@ -195,6 +242,9 @@ int main(int argc, char *argv[])
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
                   "Mesh file to use.");
+   args.AddOption(&dim, "-dim", "--dimension", "Dimension of the problem.");
+   args.AddOption(&elem_per_mpi, "-epm", "--elem-per-mpi",
+                  "Number of element per mpi task.");
    args.AddOption(&problem_num, "-p", "--problem",
                   "Problem setup to use. See options in velocity_function().");
    args.AddOption(&rs_levels, "-rs", "--refine-serial",
@@ -240,6 +290,8 @@ int main(int argc, char *argv[])
                   "Enable or disable next gen full assembly for the HO solution.");
    args.AddOption(&device_config, "-d", "--device",
                   "Device configuration string, see Device::Configure().");
+   args.AddOption(&gpu_aware_mpi, "-gam", "--gpu-aware-mpi", "-no-gam",
+                  "--no-gpu-aware-mpi", "Enable GPU aware MPI communications.");
    args.AddOption(&smth_ind_type, "-si", "--smth_ind",
                   "Smoothness indicator: 0 - no smoothness indicator,\n\t"
                   "                      1 - approx_quadratic,\n\t"
@@ -251,9 +303,14 @@ int main(int argc, char *argv[])
                   "                   1 - Bounds violation of the LO sltn.");
    args.AddOption(&dt, "-dt", "--time-step",
                   "Initial time step size (dt might change based on -dtc).");
+   args.AddOption(&max_tsteps, "-ms", "--max-steps",
+                  "Maximum number of steps (negative means no restriction).");
    args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
                   "--no-visualization",
                   "Enable or disable GLVis visualization.");
+   args.AddOption(&save_meshes_and_solution, "-save", "--save-meshes-and-solution",
+                  "-no-save", "--save-meshes-and-solution",
+                  "Print the final meshes and solution.");
    args.AddOption(&visit, "-visit", "--visit-datafiles", "-no-visit",
                   "--no-visit-datafiles",
                   "Save data files for VisIt (visit.llnl.gov) visualization.");
@@ -265,6 +322,8 @@ int main(int argc, char *argv[])
                   "Enable remap of synchronized product fields.");
    args.AddOption(&vis_steps, "-vs", "--visualization-steps",
                   "Visualize every n-th timestep.");
+   args.AddOption(&dev_pool_size, "-pool", "--dev-pool-size",
+                  "Size (in GB) for the umpire device pool");
    args.Parse();
    if (!args.Good())
    {
@@ -273,22 +332,125 @@ int main(int argc, char *argv[])
    }
    if (myid == 0) { args.PrintOptions(cout); }
 
+#ifdef REMHOS_USE_DEVICE_UMPIRE
+   auto &rm = umpire::ResourceManager::getInstance();
+   const char * allocator_name = "remhos_device_alloc";
+   size_t umpire_dev_pool_size = ((size_t) dev_pool_size) * 1024 * 1024 * 1024;
+   size_t umpire_dev_block_size = 1024 * 1024;
+   rm.makeAllocator<umpire::strategy::QuickPool>(allocator_name, rm.getAllocator("DEVICE"), umpire_dev_pool_size, umpire_dev_block_size);
+
+#ifdef HYPRE_USING_UMPIRE
+   HYPRE_SetUmpireDevicePoolName(allocator_name);
+#endif // HYPRE_USING_UMPIRE
+
+#ifdef MFEM_USE_UMPIRE
+   MemoryManager::SetUmpireDeviceAllocatorName(allocator_name);
+   // the umpire host memory type is slow compared to the native host memory type
+   Device::SetMemoryTypes(MemoryType::HOST, MemoryType::DEVICE_UMPIRE);
+#endif // MFEM_USING_UMPIRE
+#endif // REMHOS_USE_DEVICE_UMPIRE
+
+//setup caliper config manager
+#ifdef USE_CALIPER
+   setupCaliper();
+
+   cali::ConfigManager calimgr;
+   if (calimgr.error())
+       std::cerr << "caliper config error: " << calimgr.error_msg() << std::endl;
+   calimgr.start();
+   //adiak::init(nullptr);
+   //adiak::cmdline();
+   //adiak::hostname();
+#endif
+
    // Enable hardware devices such as GPUs, and programming models such as
    // CUDA, OCCA, RAJA and OpenMP based on command line options.
    Device device(device_config);
+   device.SetGPUAwareMPI(gpu_aware_mpi);
    if (myid == 0) { device.Print(); }
+
+   const bool gpu_setup = device.Allows(Backend::DEVICE_MASK);
+   if (gpu_setup)
+   {
+      MFEM_VERIFY(ho_type  == HOSolverType::LocalInverse &&
+                  lo_type  == LOSolverType::MassBased &&
+                  fct_type == FCTSolverType::ClipScale, "Wrong GPU setup.");
+   }
+
+   // Prepare the missing kernels.
+   if (myid == 0) { KernelReporter::Enable(); }
+   using TENS = QuadratureInterpolator::TensorEvalKernels;
+   using DET  = QuadratureInterpolator::DetKernels;
+   using GRAD = QuadratureInterpolator::GradKernels;
+   // 2D Q1.
+   TENS::Specialization<2,QVectorLayout::byNODES,1,2,3>::Opt<1>::Add();
+   TENS::Specialization<2,QVectorLayout::byVDIM,2,3,3>::Opt<1>::Add();
+   DET::Specialization<2,2,3,3>::Add();
+   DGTraceIntegrator::AddSpecialization<2,2,3>();
+   DGMassInverse::CGKernels::Specialization<2,2,3>::Add();
+   // 2D Q2.
+   DGTraceIntegrator::AddSpecialization<2,3,4>();
+   DGMassInverse::CGKernels::Specialization<2,3,4>::Add();
+   // 2D Q3.
+   TENS::Specialization<2,QVectorLayout::byNODES,1,4,5>::Opt<1>::Add();
+   TENS::Specialization<2,QVectorLayout::byVDIM,2,3,5>::Opt<1>::Add();
+   DET::Specialization<2,2,3,5>::Add();
+   GRAD::Specialization<2,QVectorLayout::byNODES,0,2,3,5>::Add();
+   DGTraceIntegrator::AddSpecialization<2,4,5>();
+   DGMassInverse::CGKernels::Specialization<2,4,5>::Add();
+   // 3D Q1.
+   DGTraceIntegrator::AddSpecialization<3,2,4>();
+   ConvectionIntegrator::AddSpecialization<3,2,4>();
+   DGMassInverse::CGKernels::Specialization<3,2,4>::Add();
+   // 3D Q2.
+   TENS::Specialization<3,QVectorLayout::byNODES,1,3,5>::Opt<1>::Add();
+   TENS::Specialization<3,QVectorLayout::byVDIM,3,3,5>::Opt<1>::Add();
+   GRAD::Specialization<3,QVectorLayout::byNODES,0,3,2,2>::Add();
+   GRAD::Specialization<3,QVectorLayout::byVDIM,0,3,2,2>::Add();
+   MassIntegrator::AddSpecialization<3,3,5>();
+   DGTraceIntegrator::AddSpecialization<3,3,5>();
+   ConvectionIntegrator::AddSpecialization<3,3,5>();
+   // 3D Q3.
+   TENS::Specialization<3,QVectorLayout::byNODES,1,4,6>::Opt<1>::Add();
+   DGTraceIntegrator::AddSpecialization<3,4,6>();
+   ConvectionIntegrator::AddSpecialization<3,4,6>();
 
    // When not using lua, exec mode is derived from problem number convention
    if (problem_num < 10)      { exec_mode = 0; }
    else if (problem_num < 20) { exec_mode = 1; }
    else { MFEM_ABORT("Unspecified execution mode."); }
 
-   // Read the serial mesh from the given mesh file on all processors.
-   // Refine the mesh in serial to increase the resolution.
-   Mesh *mesh = new Mesh(Mesh::LoadFromFile(mesh_file, 1, 1));
-   const int dim = mesh->Dimension();
-   for (int lev = 0; lev < rs_levels; lev++) { mesh->UniformRefinement(); }
-   mesh->GetBoundingBox(bb_min, bb_max, max(order, 1));
+   Mesh mesh;
+   Array<int> mpi_partitioning;
+   if (strncmp(mesh_file, "default", 7) != 0)
+   {
+      // Read the serial mesh from the given mesh file on all processors.
+      // Refine the mesh in serial to increase the resolution.
+      mesh = Mesh::LoadFromFile(mesh_file, 1, 1);
+      for (int lev = 0; lev < rs_levels; lev++) { mesh.UniformRefinement(); }
+   }
+   else
+   {
+      mesh = PartitionMPI(dim, Mpi::WorldSize(), elem_per_mpi, myid == 0,
+                          rp_levels, mpi_partitioning);
+   }
+   dim = mesh.Dimension();
+   mesh.GetBoundingBox(bb_min, bb_max, max(order, 1));
+
+   // Parallel partitioning of the mesh.
+   // Refine the mesh further in parallel to increase the resolution.
+   ParMesh pmesh(MPI_COMM_WORLD, mesh, mpi_partitioning.GetData());
+   mesh.Clear();
+   for (int lev = 0; lev < rp_levels; lev++) { pmesh.UniformRefinement(); }
+   MPI_Comm comm = pmesh.GetComm();
+   const int NE  = pmesh.GetNE();
+
+   if (strncmp(mesh_file, "default", 7) == 0)
+   {
+      MFEM_VERIFY(pmesh.GetGlobalNE() == Mpi::WorldSize() * elem_per_mpi,
+                  "Mesh generation error.");
+      MFEM_VERIFY(NE == elem_per_mpi, "Mesh generation error.");
+   }
 
    // Only standard assembly in 1D (some mfem functions just abort in 1D).
    if ((pa || next_gen_full) && dim == 1)
@@ -297,14 +459,6 @@ int main(int argc, char *argv[])
       pa = false;
       next_gen_full = false;
    }
-
-   // Parallel partitioning of the mesh.
-   // Refine the mesh further in parallel to increase the resolution.
-   ParMesh pmesh(MPI_COMM_WORLD, *mesh);
-   delete mesh;
-   for (int lev = 0; lev < rp_levels; lev++) { pmesh.UniformRefinement(); }
-   MPI_Comm comm = pmesh.GetComm();
-   const int NE  = pmesh.GetNE();
 
    // Define the ODE solver used for time integration. Several explicit
    // Runge-Kutta methods are available.
@@ -393,14 +547,24 @@ int main(int argc, char *argv[])
       v.ProjectCoefficient(vcoeff);
 
       double t = 0.0;
+#ifdef USE_CALIPER
+      CALI_CXX_MARK_LOOP_BEGIN(mainloop, "rem.mainloop");
+#endif
       while (t < t_final)
       {
+#ifdef USE_CALIPER
+         CALI_CXX_MARK_LOOP_ITERATION(mainloop, t);
+#endif
          t += dt;
          // Move the mesh nodes.
          x.Add(std::min(dt, t_final-t), v);
          // Update the node velocities.
          v.ProjectCoefficient(vcoeff);
       }
+#ifdef USE_CALIPER
+      CALI_CXX_MARK_LOOP_END(mainloop);
+#endif
+
 
       // Pseudotime velocity.
       add(x, -1.0, x0, v_gf);
@@ -508,6 +672,9 @@ int main(int argc, char *argv[])
    {
       M_HO.SetAssemblyLevel(AssemblyLevel::PARTIAL);
       K_HO.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+
+      k.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+      m.SetAssemblyLevel(AssemblyLevel::PARTIAL);
    }
 
    if (next_gen_full)
@@ -525,18 +692,29 @@ int main(int argc, char *argv[])
    }
 
    // Compute the lumped mass matrix.
-   Vector lumpedM;
    ParBilinearForm ml(&pfes);
    ml.AddDomainIntegrator(new LumpedIntegrator(new MassIntegrator));
-   ml.Assemble();
-   ml.Finalize();
-   ml.SpMat().GetDiag(lumpedM);
+   if (!pa)
+   {
+      ml.Assemble();
+      ml.Finalize();
+   }
 
    m.Assemble();
    m.Finalize();
    int skip_zeros = 0;
    k.Assemble(skip_zeros);
    k.Finalize(skip_zeros);
+
+   Vector lumpedM;
+   if (!pa) { ml.SpMat().GetDiag(lumpedM); }
+   else
+   {
+      lumpedM.SetSize(m.Height());
+      Vector ones(m.Height());
+      ones = 1.0;
+      m.Mult(ones, lumpedM);
+   }
 
    // Store topological dof data.
    DofInfo dofs(pfes, bounds_type);
@@ -825,18 +1003,21 @@ int main(int argc, char *argv[])
    }
 
    // Print the starting meshes and initial condition.
-   ofstream meshHO("meshHO_init.mesh");
-   meshHO.precision(precision);
-   pmesh.PrintAsOne(meshHO);
-   if (subcell_mesh)
+   if (save_meshes_and_solution)
    {
-      ofstream meshLO("meshLO_init.mesh");
-      meshLO.precision(precision);
-      subcell_mesh->PrintAsOne(meshLO);
+      ofstream meshHO("meshHO_init.mesh");
+      meshHO.precision(precision);
+      pmesh.PrintAsOne(meshHO);
+      if (subcell_mesh)
+      {
+         ofstream meshLO("meshLO_init.mesh");
+         meshLO.precision(precision);
+         subcell_mesh->PrintAsOne(meshLO);
+      }
+      ofstream sltn("sltn_init.gf");
+      sltn.precision(precision);
+      u.SaveAsOne(sltn);
    }
-   ofstream sltn("sltn_init.gf");
-   sltn.precision(precision);
-   u.SaveAsOne(sltn);
 
    // Create data collection for solution output: either VisItDataCollection for
    // ASCII data files, or SidreDataCollection for binary data files.
@@ -918,7 +1099,8 @@ int main(int argc, char *argv[])
 
    AdvectionOperator adv(offset, m, ml, lumpedM, k, M_HO, K_HO,
                          x, xsub, v_gf, v_sub_gf, asmbl, lom, dofs,
-                         ho_solver, lo_solver, fct_solver, mono_solver);
+                         ho_solver, lo_solver, fct_solver, mono_solver,
+                         gpu_setup);
 
    adv.verify_bounds = verify_bounds;
    if (fct_solver) { fct_solver->verify_bounds = verify_bounds; }
@@ -1095,6 +1277,8 @@ int main(int argc, char *argv[])
          else { res = u; }
       }
 
+      if (ti_total == max_tsteps) { done = true; }
+
       if (done || ti % vis_steps == 0)
       {
          if (myid == 0)
@@ -1129,21 +1313,33 @@ int main(int argc, char *argv[])
       }
    }
 
+   int steps = ti_total;
+   switch (ode_solver_type)
+   {
+   case 2: steps *= 2; break;
+   case 3: steps *= 3; break;
+   case 4: steps *= 4; break;
+   case 6: steps *= 6; break;
+   }
+   adv.PrintTimingData(steps);
+
    if (dt_control != TimeStepControl::FixedTimeStep && myid == 0)
    {
       cout << "Total time steps: " << ti_total
            << " (" << ti_total-ti << " repeated)." << endl;
    }
 
-   // Move to the final mesh position
+   // Move to the final mesh position.
+   // (use t instead of t_final in case we're taking at most max_tsteps steps).
    if (exec_mode == 1)
    {
-      add(x0, t_final, v_gf, x);
+      add(x0, t, v_gf, x);
       // Reset precomputed geometric data.
       pmesh.DeleteGeometricFactors();
    }
 
    // Print the final meshes and solution.
+   if (save_meshes_and_solution)
    {
       ofstream meshHO("meshHO_final.mesh");
       meshHO.precision(precision);
@@ -1163,10 +1359,23 @@ int main(int argc, char *argv[])
    double mass_u_loc = 0.0, mass_us_loc = 0.0;
    if (exec_mode == 1)
    {
-      ml.BilinearForm::operator=(0.0);
-      ml.Assemble();
-      lumpedM.HostRead();
-      ml.SpMat().GetDiag(lumpedM);
+      // Using lumped diagonal for mass conservation.
+      if (!pa)
+      {
+         ml.BilinearForm::operator=(0.0);
+         ml.Assemble();
+         lumpedM.HostRead();
+         ml.SpMat().GetDiag(lumpedM);
+      }
+      else
+      {
+         ParBilinearForm m(&pfes);
+         m.AddDomainIntegrator(new MassIntegrator);
+         m.Assemble();
+         Vector ones(m.Height());
+         ones = 1.0;
+         m.Mult(ones, lumpedM);
+      }
       mass_u_loc = lumpedM * u;
       if (product_sync) { mass_us_loc = lumpedM * us; }
    }
@@ -1177,6 +1386,7 @@ int main(int argc, char *argv[])
    }
    double mass_u, mass_us = 0.0;
    MPI_Allreduce(&mass_u_loc, &mass_u, 1, MPI_DOUBLE, MPI_SUM, comm);
+   final_mass_u = mass_u;
    const double umax_loc = u.Max();
    MPI_Allreduce(&umax_loc, &u_max, 1, MPI_DOUBLE, MPI_MAX, comm);
    if (product_sync)
@@ -1235,7 +1445,7 @@ int main(int argc, char *argv[])
       }
    }
 
-   if (smth_indicator)
+   if (smth_indicator && save_meshes_and_solution)
    {
       // Print the values of the smoothness indicator.
       ParGridFunction si_val;
@@ -1269,7 +1479,9 @@ int main(int argc, char *argv[])
       delete lom.SubFes1;
       delete lom.VolumeTerms;
    }
-
+#ifdef USE_CALIPER
+   calimgr.flush();
+#endif
    return 0;
 }
 
@@ -1282,18 +1494,28 @@ AdvectionOperator::AdvectionOperator(const Array<int> &offsets,
                                      GridFunction &vel, GridFunction &sub_vel,
                                      Assembly &_asmbl,
                                      LowOrderMethod &_lom, DofInfo &_dofs,
-                                     HOSolver *hos, LOSolver *los, FCTSolver *fct,
-                                     MonolithicSolver *mos) :
+                                     HOSolver *hos, LOSolver *los,
+                                     FCTSolver *fct, MonolithicSolver *mos,
+                                     bool gpu) :
    LimitedTimeDependentOperator(offsets.Last()), block_offsets(offsets),
    Mbf(Mbf_), ml(_ml), Kbf(Kbf_),
    M_HO(M_HO_), K_HO(K_HO_),
    lumpedM(_lumpedM),
+   ones(lumpedM.Size()),
    start_mesh_pos(pos.Size()), start_submesh_pos(sub_vel.Size()),
    mesh_pos(pos), submesh_pos(sub_pos),
    mesh_vel(vel), submesh_vel(sub_vel),
    x_gf(Kbf.ParFESpace()),
    asmbl(_asmbl), lom(_lom), dofs(_dofs),
-   ho_solver(hos), lo_solver(los), fct_solver(fct), mono_solver(mos) { }
+   ho_solver(hos), lo_solver(los), fct_solver(fct), mono_solver(mos),
+   timer(M_HO.Size()), gpu_setup(gpu)
+{
+   if (ho_solver)  { ho_solver->timer  = &timer; }
+   if (lo_solver)  { lo_solver->timer  = &timer; }
+   if (fct_solver) { fct_solver->timer = &timer; }
+
+   ones = 1.0;
+}
 
 void check_violation(const Vector &u_new,
                      const Vector &u_min, const Vector &u_max,
@@ -1348,21 +1570,34 @@ void AdvectionOperator::MultUnlimited(const Vector &X, Vector &Y) const
       // Reset precomputed geometric data.
       Mbf.FESpace()->GetMesh()->DeleteGeometricFactors();
 
-      // Reassemble on the new mesh. Element contributions.
-      // Currently needed to have the sparse matrices used by the LO methods.
-      Mbf.BilinearForm::operator=(0.0);
-      Mbf.Assemble();
-      Kbf.BilinearForm::operator=(0.0);
-      Kbf.Assemble(0);
-      ml.BilinearForm::operator=(0.0);
-      ml.Assemble();
-      lumpedM.HostReadWrite();
-      ml.SpMat().GetDiag(lumpedM);
+      if (gpu_setup == false)
+      {
+         // Reassemble on the new mesh. Element contributions.
+         // Currently needed to have the sparse matrices used by the LO methods.
+         Mbf.BilinearForm::operator=(0.0);
+         Mbf.Assemble();
+         Kbf.BilinearForm::operator=(0.0);
+         Kbf.Assemble(0);
+      }
 
+      timer.sw_L2inv.Start();
       M_HO.BilinearForm::operator=(0.0);
       M_HO.Assemble();
+      timer.sw_L2inv.Stop();
+
+      if (Mbf.GetAssemblyLevel() != AssemblyLevel::PARTIAL)
+      {
+         ml.BilinearForm::operator=(0.0);
+         ml.Assemble();
+         lumpedM.HostReadWrite();
+         ml.SpMat().GetDiag(lumpedM);
+      }
+      else { M_HO.Mult(ones, lumpedM); }
+
+      timer.sw_rhs.Start();
       K_HO.BilinearForm::operator=(0.0);
       K_HO.Assemble(0);
+      timer.sw_rhs.Stop();
 
       if (lom.pk)
       {
@@ -1370,32 +1605,35 @@ void AdvectionOperator::MultUnlimited(const Vector &X, Vector &Y) const
          lom.pk->Assemble();
       }
 
-      // Face contributions.
-      asmbl.bdrInt = 0.;
-      Mesh *mesh = M_HO.FESpace()->GetMesh();
-      const int dim = mesh->Dimension(), ne = mesh->GetNE();
-      Array<int> bdrs, orientation;
-      FaceElementTransformations *Trans;
+      if (gpu_setup == false)
+      {
+         // Face contributions.
+         asmbl.bdrInt = 0.;
+         Mesh *mesh = M_HO.FESpace()->GetMesh();
+         const int dim = mesh->Dimension(), ne = mesh->GetNE();
+         Array<int> bdrs, orientation;
+         FaceElementTransformations *Trans;
 
-      if (auto RD_ptr = dynamic_cast<const PAResidualDistribution*>(lo_solver))
-      {
-         RD_ptr->SampleVelocity(FaceType::Interior);
-         RD_ptr->SampleVelocity(FaceType::Boundary);
-         RD_ptr->SetupPA(FaceType::Interior);
-         RD_ptr->SetupPA(FaceType::Boundary);
-      }
-      else
-      {
-         for (int k = 0; k < ne; k++)
+         if (auto RD_ptr = dynamic_cast<const PAResidualDistribution*>(lo_solver))
          {
-            if (dim == 1)      { mesh->GetElementVertices(k, bdrs); }
-            else if (dim == 2) { mesh->GetElementEdges(k, bdrs, orientation); }
-            else if (dim == 3) { mesh->GetElementFaces(k, bdrs, orientation); }
-
-            for (int i = 0; i < dofs.numBdrs; i++)
+            RD_ptr->SampleVelocity(FaceType::Interior);
+            RD_ptr->SampleVelocity(FaceType::Boundary);
+            RD_ptr->SetupPA(FaceType::Interior);
+            RD_ptr->SetupPA(FaceType::Boundary);
+         }
+         else
+         {
+            for (int k = 0; k < ne; k++)
             {
-               Trans = mesh->GetFaceElementTransformations(bdrs[i]);
-               asmbl.ComputeFluxTerms(k, i, Trans, lom);
+               if (dim == 1)      { mesh->GetElementVertices(k, bdrs); }
+               else if (dim == 2) { mesh->GetElementEdges(k, bdrs, orientation); }
+               else if (dim == 3) { mesh->GetElementFaces(k, bdrs, orientation); }
+
+               for (int i = 0; i < dofs.numBdrs; i++)
+               {
+                  Trans = mesh->GetFaceElementTransformations(bdrs[i]);
+                  asmbl.ComputeFluxTerms(k, i, Trans, lom);
+               }
             }
          }
       }
@@ -1640,6 +1878,44 @@ void AdvectionOperator::LimitMult(const Vector &X, Vector &Y) const
    }
 }
 
+void AdvectionOperator::PrintTimingData(int steps) const
+{
+   const MPI_Comm com = M_HO.ParFESpace()->GetComm();
+   const int myid = M_HO.ParFESpace()->GetMyRank();
+
+   auto ho  = dynamic_cast<LocalInverseHOSolver *>(ho_solver);
+   auto lo  = dynamic_cast<MassBasedAvg *>(lo_solver);
+   auto fct = dynamic_cast<ClipScaleSolver *>(fct_solver);
+   if (!ho || !lo || !fct) { return; }
+
+   double my_rt[5], T[5];
+   my_rt[0] = timer.sw_rhs.RealTime();
+   my_rt[1] = timer.sw_L2inv.RealTime();
+   my_rt[2] = timer.sw_LO.RealTime();
+   my_rt[3] = timer.sw_FCT.RealTime();
+   my_rt[4] = my_rt[0] + my_rt[2] + my_rt[3];
+   MPI_Reduce(my_rt, T, 5, MPI_DOUBLE, MPI_MAX, 0, com);
+
+   const HYPRE_BigInt dofs_steps = M_HO.ParFESpace()->GlobalVSize() * steps;
+
+   if (myid == 0)
+   {
+      std::cout << "---" << std::endl;
+      std::cout << "RHS   kernel time: " << T[0] << std::endl
+                << "L2inv kernel time: " << T[1] << std::endl
+                << "LO    kernel time: " << T[2] << std::endl
+                << "FCT   kernel time: " << T[3] << std::endl
+                << "Total kernel time: " << T[4] << std::endl;
+      std::cout << "---" << std::endl;
+      std::cout << "FOM RHS: " << 1e-6 * dofs_steps / T[0] << std::endl
+                << "FOM INV: " << 1e-6 * dofs_steps / T[1] << std::endl
+                << "FOM LO:  " << 1e-6 * dofs_steps / T[2] << std::endl
+                << "FOM FCT: " << 1e-6 * dofs_steps / T[3] << std::endl
+                << "FOM:     " << 1e-6 * dofs_steps / T[4] << std::endl;
+      std::cout << "(megadofs x time steps / second)\n---" << std::endl;
+   }
+}
+
 void AdvectionOperator::UpdateTimeStepEstimate(const Vector &x,
                                                const Vector &dx,
                                                const Vector &x_min,
@@ -1651,6 +1927,7 @@ void AdvectionOperator::UpdateTimeStepEstimate(const Vector &x,
    int n = x.Size();
    const double eps = 1e-12;
    double dt = numeric_limits<double>::infinity();
+   x_min.HostRead(), x_max.HostRead(), x.HostRead(), dx.HostRead();
 
    for (int i = 0; i < n; i++)
    {
@@ -2053,3 +2330,19 @@ double inflow_function(const Vector &x)
    }
    else { return 0.0; }
 }
+
+void setupCaliper()
+{
+#ifdef USE_CALIPER
+#ifdef HAVE_MPI
+   cali_mpi_init();
+#endif
+
+   cali_config_preset("CALI_LOG_VERBOSITY", "0");
+   cali_config_preset("CALI_CALIPER_ATTRIBUTE_DEFAULT_SCOPE", "process");
+
+   //cali_set_global_string_byname("rem.git_vers", GIT_VERS);
+   //cali_set_global_string_byname("rem.git_hash", GIT_HASH);
+#endif
+}
+

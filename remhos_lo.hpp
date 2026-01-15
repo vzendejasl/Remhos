@@ -22,6 +22,8 @@
 namespace mfem
 {
 
+struct TimingData;
+
 // Low-Order Solver.
 class LOSolver
 {
@@ -37,6 +39,8 @@ public:
    virtual void UpdateTimeStep(real_t dt_new) { dt = dt_new; }
 
    virtual void CalcLOSolution(const Vector &u, Vector &du) const = 0;
+
+   TimingData *timer = nullptr;
 };
 
 class Assembly;
@@ -95,8 +99,8 @@ protected:
 
 public:
    MassBasedAvg(ParFiniteElementSpace &space, HOSolver &hos,
-                const GridFunction *mesh_vel)
-      : LOSolver(space), ho_solver(hos), mesh_v(mesh_vel) { }
+       const GridFunction *mesh_vel)
+       : LOSolver(space), ho_solver(hos), mesh_v(mesh_vel) { }
 
    // Temporary HO solution, used only in the next call to CalcLOSolution().
    void SetHOSolution(Vector &du) { du_HO = &du; }
