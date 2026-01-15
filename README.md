@@ -260,7 +260,17 @@ round-off distance from the above reference values.
 
 ## Performance Timing and FOM
 
-To appear soon.
+Remhos reports several FOMs in the terminal, based on the distinct phases of an
+advection-based remap calculation. All FOMs are reported in
+`(megaDOFs x time steps) per second`, reflecting the throughput of the calculation.
+
+- FOM RHS: construction of the right-hand side of the system.
+- FOM INV: inverting the high-order operator, which is used to obtain a
+           high-order unbounded (HO) solution.
+- FOM LO:  computation of the low-order bounded (LO) approximation of the solution.
+- FOM FCT: computation of the FCT solution, combining the LO and HO solutions to
+           obtain a bounded high-order solution.
+- **FOM**: performance metric combining all the above phases.
 
 ## Versions
 
@@ -276,7 +286,7 @@ comment in the [issue tracker](https://github.com/CEED/Remhos/issues).
 The following copyright applies to each file in the CEED software suite,
 unless otherwise stated in the file:
 
-> Copyright (c) 2017, Lawrence Livermore National Security, LLC. Produced at the
+> Copyright (c) 2026, Lawrence Livermore National Security, LLC. Produced at the
 > Lawrence Livermore National Laboratory. LLNL-CODE-734707. All Rights reserved.
 
 See files LICENSE and NOTICE for details.
