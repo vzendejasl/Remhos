@@ -260,6 +260,8 @@ round-off distance from the above reference values.
 
 ## Performance Timing and FOM
 
+Performance is tracked only for the configuration `-ho 3 -lo 5 -fct 2`.
+This configuration supports partial assembly and GPU execution.
 Remhos reports several FOMs in the terminal, based on the distinct phases of an
 advection-based remap calculation. All FOMs are reported in
 `(megaDOFs x time steps) per second`, reflecting the throughput of the calculation.
