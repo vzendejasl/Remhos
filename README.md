@@ -238,6 +238,9 @@ Alternatively, verify the final mass (`mass`) and maximum value (`max`) for the 
 12. `mpirun -np 8 remhos -m ./data/inline-quad.mesh -p 7 -rs 3 -o 1 -dt 0.01 -tf 20 -mono 1 -si 2`
 13. `mpirun -np 8 remhos -m ./data/inline-quad.mesh -p 6 -rs 2 -o 1 -dt 0.01 -tf 20 -mono 1 -si 1`
 
+"Remap"
+mpirun -np 8 ./remhos -m ./data/inline-quad.mesh -p 14 -rs 2 -rp 1 -dt 0.0005 -tf 0.1 -ho 1 -lo 2 -fct 3 -rr -vis -vs 50
+
 
 | `run` | `mass` | `max` |
 | ----- | ------ | ----- |

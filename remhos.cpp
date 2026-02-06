@@ -231,6 +231,7 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    bool visit = false;
    bool verify_bounds = false;
    bool product_sync = false;
+   bool return_remap = false;
    int vis_steps = 100;
    const char *device_config = "cpu";
    bool gpu_aware_mpi = false;
@@ -320,6 +321,9 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    args.AddOption(&product_sync, "-ps", "--product-sync", "-no-ps",
                   "--no-product-sync",
                   "Enable remap of synchronized product fields.");
+   args.AddOption(&return_remap, "-rr", "--return-remap", "-no-rr",
+                  "--no-return-remap",
+                  "After remap, run a reverse remap phase to return the mesh.");
    args.AddOption(&vis_steps, "-vs", "--visualization-steps",
                   "Visualize every n-th timestep.");
    args.AddOption(&dev_pool_size, "-pool", "--dev-pool-size",
@@ -419,6 +423,15 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    if (problem_num < 10)      { exec_mode = 0; }
    else if (problem_num < 20) { exec_mode = 1; }
    else { MFEM_ABORT("Unspecified execution mode."); }
+
+   if (return_remap && exec_mode != 1)
+   {
+      if (myid == 0)
+      {
+         mfem_warning("Return remap is only supported in remap mode; ignoring.");
+      }
+      return_remap = false;
+   }
 
    Mesh mesh;
    Array<int> mpi_partitioning;
@@ -1105,212 +1118,266 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    adv.verify_bounds = verify_bounds;
    if (fct_solver) { fct_solver->verify_bounds = verify_bounds; }
 
-   double t = 0.0;
-   adv.SetTime(t);
-   adv.SetTimeStepControl(dt_control);
-   ode_solver->Init(adv);
-
-   double u_min, u_max;
-   GetMinMax(u, u_min, u_max);
-   double s_min = -1.0, s_max = -1.0;
-   if (product_sync) { ComputeMinMaxS(NE, us, u, s_min, s_max); }
-
+   Vector remap_start_pos, remap_start_sub;
+   Vector v_gf_orig, v_sub_gf_orig;
    if (exec_mode == 1)
    {
-      adv.SetRemapStartPos(x0, x0_sub);
-
-      // For remap, the pseudo-time always evolves from 0 to 1.
-      t_final = 1.0;
+      v_gf_orig.SetSize(v_gf.Size());
+      v_gf_orig = v_gf;
+      if (use_subcell_RD)
+      {
+         v_sub_gf_orig.SetSize(v_sub_gf.Size());
+         v_sub_gf_orig = v_sub_gf;
+      }
    }
 
    ParGridFunction res = u;
    double residual = 0.0;
-
-   // Time-integration (loop over the time iterations, ti, with a time-step dt).
-   bool done = false;
    BlockVector Sold(S);
-   int ti_total = 0, ti = 0;
-   while (done == false)
+   int ti_total = 0;
+   int ti = 0;
+   double t_end = 0.0;
+
+   const int n_phases = (exec_mode == 1 && return_remap) ? 2 : 1;
+   for (int phase = 0; phase < n_phases; phase++)
    {
-      double dt_real = min(dt, t_final - t);
-
-      // This also resets the time step estimate when automatic dt is on.
-      adv.SetDt(dt_real);
-      adv.ResetTimeStepRatio();
-
-#ifdef REMHOS_FCT_PRODUCT_DEBUG
-      if (product_sync)
+      const bool reverse = (phase == 1);
+      if (exec_mode == 1)
       {
-         double s_min_debug, s_max_debug;
-         ComputeMinMaxS(pmesh.GetNE(), us, u, s_min_debug, s_max_debug);
-         if (myid == 0)
-         {
-            std::cout << "   --- Full time step" << std::endl;
-            std::cout << "   in:  ";
-            std::cout << std::scientific << std::setprecision(5);
-            std::cout << "min_s: " << s_min_debug
-                      << "; max_s: " << s_max_debug << std::endl;
-         }
-      }
-#endif
-
-      Sold = S;
-      ode_solver->Step(S, t, dt_real);
-      ti++;
-      ti_total++;
-
-      if (dt_control != TimeStepControl::FixedTimeStep)
-      {
-         real_t dt_ratio = adv.GetTimeStepRatio();
-         if (dt_ratio < 1.)
-         {
-            // Repeat with the proper time step.
-            if (myid == 0)
-            {
-               cout << "Repeat / decrease dt: "
-                    << dt_real << " --> " << 0.85 * dt << endl;
-            }
-            ti--;
-            t -= dt_real;
-            S  = Sold;
-            dt = 0.85 * dt;
-            if (dt < 1e-12) { MFEM_ABORT("The time step crashed!"); }
-            continue;
-         }
-         else if (dt_ratio > 1.25) { dt *= 1.02; }
-      }
-
-      // S has been modified, update the alias
-      u.SyncMemory(S);
-
-      if (product_sync)
-      {
-         us.SyncMemory(S);
-#ifdef REMHOS_FCT_PRODUCT_DEBUG
-         double s_min_debug, s_max_debug;
-         ComputeMinMaxS(NE, us, u, s_min_debug, s_max_debug);
-         if (myid == 0)
-         {
-            std::cout << "   out: ";
-            std::cout << std::scientific << std::setprecision(5);
-            std::cout << "min_s: " << s_min_debug
-                      << "; max_s: " << s_max_debug << std::endl;
-         }
-#endif
-      }
-
-      // Monotonicity check for debug purposes mainly.
-      if (verify_bounds && forced_bounds && smth_indicator == NULL)
-      {
-         const double eps = 1e-10;
-         double u_min_new, u_max_new,
-                s_min_new = s_min, s_max_new = s_max;
-         GetMinMax(u, u_min_new, u_max_new);
-         if (product_sync)
-         {
-            ComputeMinMaxS(NE, us, u, s_min_new, s_max_new);
-         }
-
-         if (problem_num % 10 != 6 && problem_num % 10 != 7)
+         if (reverse)
          {
             if (myid == 0)
             {
-               MFEM_VERIFY(u_min_new > u_min - eps,
-                           "Undershoot of " << u_min - u_min_new);
-               MFEM_VERIFY(u_max_new < u_max + eps,
-                           "Overshoot of " << u_max_new - u_max);
-               MFEM_VERIFY(s_min_new > s_min - eps,
-                           "Undershoot in s of " << s_min - s_min_new);
-               MFEM_VERIFY(s_max_new < s_max + eps,
-                           "Overshoot in s of " << s_max_new - s_max);
+               cout << "Starting reverse remap phase." << endl;
             }
-            u_min = u_min_new;
-            u_max = u_max_new;
+            x.HostReadWrite();
+            remap_start_pos = x;
+            if (use_subcell_RD)
+            {
+               MFEM_VERIFY(xsub != NULL, "Subcell mesh not defined!");
+               xsub->HostReadWrite();
+               remap_start_sub = *xsub;
+            }
          }
          else
          {
-            if (myid == 0)
-            {
-               MFEM_VERIFY(u_min_new > 0.0 - eps,
-                           "Undershoot of " << 0.0 - u_min_new);
-               MFEM_VERIFY(u_max_new < 1.0 + eps,
-                           "Overshoot of " << u_max_new - 1.0);
-               MFEM_VERIFY(s_min_new > 0.0 - eps,
-                           "Undershoot in s of " << 0.0 - s_min_new);
-               MFEM_VERIFY(s_max_new < 1.0 + eps,
-                           "Overshoot in s of " << s_max_new - 1.0);
-            }
+            remap_start_pos = x0;
+            if (use_subcell_RD) { remap_start_sub = x0_sub; }
          }
-      }
 
-      if (exec_mode == 1)
-      {
-         x0.HostReadWrite(); v_sub_gf.HostReadWrite();
-         x.HostReadWrite();
-         add(x0, t, v_gf, x);
+         v_gf = v_gf_orig;
+         if (reverse) { v_gf *= -1.0; }
          if (use_subcell_RD)
          {
-            x0_sub.HostReadWrite(); v_sub_gf.HostReadWrite();
-            MFEM_VERIFY(xsub != NULL, "Subcell mesh not defined!");
-            xsub->HostReadWrite();
-            add(x0_sub, t, v_sub_gf, *xsub);
-         }
-      }
-
-      if (problem_num != 6 && problem_num != 7 && problem_num != 8)
-      {
-         done = (t >= t_final - 1.e-8*dt);
-      }
-      else
-      {
-         // Steady state problems - stop at convergence.
-         double res_loc = 0.;
-         lumpedM.HostReadWrite(); u.HostReadWrite(); res.HostReadWrite();
-         for (int i = 0; i < res.Size(); i++)
-         {
-            res_loc += pow( (lumpedM(i) * u(i) / dt) - (lumpedM(i) * res(i) / dt), 2. );
-         }
-         MPI_Allreduce(&res_loc, &residual, 1, MPI_DOUBLE, MPI_SUM, comm);
-
-         residual = sqrt(residual);
-         if (residual < 1.e-12 && t >= 1.) { done = true; u = res; }
-         else { res = u; }
-      }
-
-      if (ti_total == max_tsteps) { done = true; }
-
-      if (done || ti % vis_steps == 0)
-      {
-         if (myid == 0)
-         {
-            cout << "time step: " << ti << ", time: " << t
-                 << ", dt: " << dt << ", residual: " << residual << endl;
+            v_sub_gf = v_sub_gf_orig;
+            if (reverse) { v_sub_gf *= -1.0; }
          }
 
-         if (visualization)
+         adv.SetRemapStartPos(remap_start_pos, remap_start_sub);
+
+         // For remap, the pseudo-time always evolves from 0 to 1.
+         t_final = 1.0;
+      }
+
+      double t = 0.0;
+      adv.SetTime(t);
+      adv.SetTimeStepControl(dt_control);
+      ode_solver->Init(adv);
+
+      double u_min, u_max;
+      GetMinMax(u, u_min, u_max);
+      double s_min = -1.0, s_max = -1.0;
+      if (product_sync) { ComputeMinMaxS(NE, us, u, s_min, s_max); }
+
+      residual = 0.0;
+      res = u;
+
+      // Time-integration (loop over the time iterations, ti, with a time-step dt).
+      bool done = false;
+      while (done == false)
+      {
+         double dt_real = min(dt, t_final - t);
+
+         // This also resets the time step estimate when automatic dt is on.
+         adv.SetDt(dt_real);
+         adv.ResetTimeStepRatio();
+
+#ifdef REMHOS_FCT_PRODUCT_DEBUG
+         if (product_sync)
          {
-            int Wx = 0, Wy = 0; // window position
-            int Ww = 400, Wh = 400; // window size
-            VisualizeField(sout, vishost, visport, u, "Solution",
-                           Wx, Wy, Ww, Wh);
+            double s_min_debug, s_max_debug;
+            ComputeMinMaxS(pmesh.GetNE(), us, u, s_min_debug, s_max_debug);
+            if (myid == 0)
+            {
+               std::cout << "   --- Full time step" << std::endl;
+               std::cout << "   in:  ";
+               std::cout << std::scientific << std::setprecision(5);
+               std::cout << "min_s: " << s_min_debug
+               << "; max_s: " << s_max_debug << std::endl;
+            }
+         }
+#endif
+
+         Sold = S;
+         ode_solver->Step(S, t, dt_real);
+         ti++;
+         ti_total++;
+
+         if (dt_control != TimeStepControl::FixedTimeStep)
+         {
+            real_t dt_ratio = adv.GetTimeStepRatio();
+            if (dt_ratio < 1.)
+            {
+               // Repeat with the proper time step.
+               if (myid == 0)
+               {
+                  cout << "Repeat / decrease dt: "
+                  << dt_real << " --> " << 0.85 * dt << endl;
+               }
+               ti--;
+               t -= dt_real;
+               S  = Sold;
+               dt = 0.85 * dt;
+               if (dt < 1e-12) { MFEM_ABORT("The time step crashed!"); }
+               continue;
+            }
+            else if (dt_ratio > 1.25) { dt *= 1.02; }
+         }
+
+         // S has been modified, update the alias
+         u.SyncMemory(S);
+
+         if (product_sync)
+         {
+            us.SyncMemory(S);
+#ifdef REMHOS_FCT_PRODUCT_DEBUG
+            double s_min_debug, s_max_debug;
+            ComputeMinMaxS(NE, us, u, s_min_debug, s_max_debug);
+            if (myid == 0)
+            {
+               std::cout << "   out: ";
+               std::cout << std::scientific << std::setprecision(5);
+               std::cout << "min_s: " << s_min_debug
+               << "; max_s: " << s_max_debug << std::endl;
+            }
+#endif
+         }
+
+         // Monotonicity check for debug purposes mainly.
+         if (verify_bounds && forced_bounds && smth_indicator == NULL)
+         {
+            const double eps = 1e-10;
+            double u_min_new, u_max_new,
+            s_min_new = s_min, s_max_new = s_max;
+            GetMinMax(u, u_min_new, u_max_new);
             if (product_sync)
             {
-               // Recompute s = u_s / u.
-               ComputeRatio(pmesh.GetNE(), us, u, s, u_bool_el, u_bool_dofs);
-               VisualizeField(vis_s, vishost, visport, s, "Solution s",
-                              Wx + Ww, Wy, Ww, Wh);
-               VisualizeField(vis_us, vishost, visport, us, "Solution u_s",
-                              Wx + 2*Ww, Wy, Ww, Wh);
+               ComputeMinMaxS(NE, us, u, s_min_new, s_max_new);
+            }
+
+            if (problem_num % 10 != 6 && problem_num % 10 != 7)
+            {
+               if (myid == 0)
+               {
+                  MFEM_VERIFY(u_min_new > u_min - eps,
+                  "Undershoot of " << u_min - u_min_new);
+                  MFEM_VERIFY(u_max_new < u_max + eps,
+                  "Overshoot of " << u_max_new - u_max);
+                  MFEM_VERIFY(s_min_new > s_min - eps,
+                  "Undershoot in s of " << s_min - s_min_new);
+                  MFEM_VERIFY(s_max_new < s_max + eps,
+                  "Overshoot in s of " << s_max_new - s_max);
+               }
+               u_min = u_min_new;
+               u_max = u_max_new;
+            }
+            else
+            {
+               if (myid == 0)
+               {
+                  MFEM_VERIFY(u_min_new > 0.0 - eps,
+                  "Undershoot of " << 0.0 - u_min_new);
+                  MFEM_VERIFY(u_max_new < 1.0 + eps,
+                  "Overshoot of " << u_max_new - 1.0);
+                  MFEM_VERIFY(s_min_new > 0.0 - eps,
+                  "Undershoot in s of " << 0.0 - s_min_new);
+                  MFEM_VERIFY(s_max_new < 1.0 + eps,
+                  "Overshoot in s of " << s_max_new - 1.0);
+               }
             }
          }
 
-         if (visit)
+         if (exec_mode == 1)
          {
-            dc->SetCycle(ti);
-            dc->SetTime(t);
-            dc->Save();
+            remap_start_pos.HostReadWrite(); v_gf.HostReadWrite();
+            x.HostReadWrite();
+            add(remap_start_pos, t, v_gf, x);
+            if (use_subcell_RD)
+            {
+               remap_start_sub.HostReadWrite(); v_sub_gf.HostReadWrite();
+               MFEM_VERIFY(xsub != NULL, "Subcell mesh not defined!");
+               xsub->HostReadWrite();
+               add(remap_start_sub, t, v_sub_gf, *xsub);
+            }
+         }
+
+         if (problem_num != 6 && problem_num != 7 && problem_num != 8)
+         {
+            done = (t >= t_final - 1.e-8*dt);
+         }
+         else
+         {
+            // Steady state problems - stop at convergence.
+            double res_loc = 0.;
+            lumpedM.HostReadWrite(); u.HostReadWrite(); res.HostReadWrite();
+            for (int i = 0; i < res.Size(); i++)
+            {
+               res_loc += pow( (lumpedM(i) * u(i) / dt) - (lumpedM(i) * res(i) / dt), 2. );
+            }
+            MPI_Allreduce(&res_loc, &residual, 1, MPI_DOUBLE, MPI_SUM, comm);
+
+            residual = sqrt(residual);
+            if (residual < 1.e-12 && t >= 1.) { done = true; u = res; }
+            else { res = u; }
+         }
+
+         if (ti_total == max_tsteps) { done = true; }
+
+         if (done || ti % vis_steps == 0)
+         {
+            if (myid == 0)
+            {
+               cout << "time step: " << ti << ", time: " << t
+               << ", dt: " << dt << ", residual: " << residual << endl;
+            }
+
+            if (visualization)
+            {
+               int Wx = 0, Wy = 0; // window position
+               int Ww = 400, Wh = 400; // window size
+               VisualizeField(sout, vishost, visport, u, "Solution",
+               Wx, Wy, Ww, Wh);
+               if (product_sync)
+               {
+                  // Recompute s = u_s / u.
+                  ComputeRatio(pmesh.GetNE(), us, u, s, u_bool_el, u_bool_dofs);
+                  VisualizeField(vis_s, vishost, visport, s, "Solution s",
+                  Wx + Ww, Wy, Ww, Wh);
+                  VisualizeField(vis_us, vishost, visport, us, "Solution u_s",
+                  Wx + 2*Ww, Wy, Ww, Wh);
+               }
+            }
+
+            if (visit)
+            {
+               dc->SetCycle(ti);
+               dc->SetTime(t);
+               dc->Save();
+            }
          }
       }
+
+      t_end = t;
    }
 
    int steps = ti_total;
@@ -1333,7 +1400,12 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    // (use t instead of t_final in case we're taking at most max_tsteps steps).
    if (exec_mode == 1)
    {
-      add(x0, t, v_gf, x);
+      add(remap_start_pos, t_end, v_gf, x);
+      if (use_subcell_RD)
+      {
+         MFEM_VERIFY(xsub != NULL, "Subcell mesh not defined!");
+         add(remap_start_sub, t_end, v_sub_gf, *xsub);
+      }
       // Reset precomputed geometric data.
       pmesh.DeleteGeometricFactors();
    }
@@ -1387,6 +1459,7 @@ MFEM_EXPORT int remhos(int argc, char *argv[], double &final_mass_u)
    double mass_u, mass_us = 0.0;
    MPI_Allreduce(&mass_u_loc, &mass_u, 1, MPI_DOUBLE, MPI_SUM, comm);
    final_mass_u = mass_u;
+   double u_max = 0.0, s_max = 0.0;
    const double umax_loc = u.Max();
    MPI_Allreduce(&umax_loc, &u_max, 1, MPI_DOUBLE, MPI_MAX, comm);
    if (product_sync)
@@ -2345,4 +2418,3 @@ void setupCaliper()
    //cali_set_global_string_byname("rem.git_hash", GIT_HASH);
 #endif
 }
-
